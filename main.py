@@ -1,7 +1,7 @@
 """
 Mini RAG API - Retriever externo para Agentforce
 --------------------------------------------------
-Backend gratuito para probar el patrón:
+Backend gratuito para probar el patron:
   Agentforce Topic -> Apex Invocable Action -> este API -> respuesta al agente
 
 Endpoints:
@@ -11,21 +11,24 @@ Endpoints:
   POST /query               -> busca los fragmentos mas relevantes para una pregunta
   GET  /health              -> healthcheck
 
-Almacenamiento: en memoria + snapshot a disco (JSON) para persistir entre reinicios
-del dyno gratuito de Render (que se duerme tras inactividad).
+Almacenamiento: Postgres (ej. Supabase free tier), persistente entre reinicios
+del dyno gratuito de Render (que se duerme tras inactividad y borra el disco
+local en cada reinicio).
 
-Busqueda: TF-IDF + similitud coseno (scikit-learn). Liviano, corre bien en el
-free tier de Render (512 MB RAM), sin necesidad de descargar modelos pesados
-de embeddings ni depender de APIs externas de pago.
+Busqueda: TF-IDF + similitud coseno (scikit-learn), calculada en memoria en
+cada query a partir de lo que hay en la base. Liviano, sin depender de
+modelos de embeddings pesados ni APIs externas de pago.
 """
 
 import os
-import json
 import uuid
 import re
 from datetime import datetime, timezone
 from typing import List, Optional
+from contextlib import contextmanager
 
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -34,16 +37,61 @@ from sklearn.metrics.pairwise import cosine_similarity
 # --------------------------------------------------------------------------
 # Configuracion
 # --------------------------------------------------------------------------
-DATA_FILE = os.environ.get("DATA_FILE", "data_store.json")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 API_KEY = os.environ.get("API_KEY", "")  # si se define, se exige header X-API-Key
 CHUNK_SIZE = 800          # caracteres por chunk
 CHUNK_OVERLAP = 150       # solapamiento entre chunks
 
+if not DATABASE_URL:
+    raise RuntimeError(
+        "Falta la variable de entorno DATABASE_URL. "
+        "Configurala con la connection string de tu proyecto Supabase (Postgres)."
+    )
+
 app = FastAPI(
     title="Mini RAG API",
     description="Retriever externo simple para Agentforce (Custom Retriever via Apex)",
-    version="1.0.0",
+    version="2.0.0",
 )
+
+# --------------------------------------------------------------------------
+# Conexion a Postgres
+# --------------------------------------------------------------------------
+@contextmanager
+def get_conn():
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    id UUID PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    source TEXT,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id SERIAL PRIMARY KEY,
+                    document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    chunk_text TEXT NOT NULL
+                );
+                """
+            )
+        conn.commit()
+
+
+init_db()
 
 # --------------------------------------------------------------------------
 # Modelos de datos
@@ -80,29 +128,8 @@ class QueryOut(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Almacenamiento simple en memoria con persistencia a disco
+# Utilidades
 # --------------------------------------------------------------------------
-# Estructura: { doc_id: {title, source, created_at, chunks: [str, ...]} }
-_store = {}
-
-
-def _load():
-    global _store
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                _store = json.load(f)
-        except Exception:
-            _store = {}
-    else:
-        _store = {}
-
-
-def _save():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(_store, f, ensure_ascii=False, indent=2)
-
-
 def _chunk_text(text: str) -> List[str]:
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
@@ -125,35 +152,45 @@ def _check_api_key(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="API key invalida o ausente")
 
 
-_load()
-
 # --------------------------------------------------------------------------
 # Endpoints
 # --------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "documents": len(_store)}
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM documents;")
+            count = cur.fetchone()[0]
+    return {"status": "ok", "documents": count}
 
 
 @app.post("/documents", response_model=DocumentOut)
 def create_document(doc: DocumentIn, x_api_key: Optional[str] = Header(None)):
     _check_api_key(x_api_key)
-    doc_id = str(uuid.uuid4())
     chunks = _chunk_text(doc.content)
     if not chunks:
         raise HTTPException(status_code=400, detail="El contenido esta vacio")
-    _store[doc_id] = {
-        "title": doc.title,
-        "source": doc.source,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "chunks": chunks,
-    }
-    _save()
+
+    doc_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO documents (id, title, source, created_at) VALUES (%s, %s, %s, %s);",
+                (doc_id, doc.title, doc.source, created_at),
+            )
+            cur.executemany(
+                "INSERT INTO chunks (document_id, chunk_text) VALUES (%s, %s);",
+                [(doc_id, c) for c in chunks],
+            )
+        conn.commit()
+
     return DocumentOut(
         id=doc_id,
         title=doc.title,
         source=doc.source,
-        created_at=_store[doc_id]["created_at"],
+        created_at=created_at.isoformat(),
         num_chunks=len(chunks),
     )
 
@@ -161,25 +198,42 @@ def create_document(doc: DocumentIn, x_api_key: Optional[str] = Header(None)):
 @app.get("/documents", response_model=List[DocumentOut])
 def list_documents(x_api_key: Optional[str] = Header(None)):
     _check_api_key(x_api_key)
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT d.id, d.title, d.source, d.created_at, COUNT(c.id) AS num_chunks
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id = d.id
+                GROUP BY d.id
+                ORDER BY d.created_at DESC;
+                """
+            )
+            rows = cur.fetchall()
+
     return [
         DocumentOut(
-            id=doc_id,
-            title=d["title"],
-            source=d.get("source"),
-            created_at=d["created_at"],
-            num_chunks=len(d["chunks"]),
+            id=str(r["id"]),
+            title=r["title"],
+            source=r["source"],
+            created_at=r["created_at"].isoformat(),
+            num_chunks=r["num_chunks"],
         )
-        for doc_id, d in _store.items()
+        for r in rows
     ]
 
 
 @app.delete("/documents/{doc_id}")
 def delete_document(doc_id: str, x_api_key: Optional[str] = Header(None)):
     _check_api_key(x_api_key)
-    if doc_id not in _store:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM documents WHERE id = %s RETURNING id;", (doc_id,))
+            deleted = cur.fetchone()
+        conn.commit()
+
+    if not deleted:
         raise HTTPException(status_code=404, detail="Documento no encontrado")
-    del _store[doc_id]
-    _save()
     return {"deleted": doc_id}
 
 
@@ -187,26 +241,26 @@ def delete_document(doc_id: str, x_api_key: Optional[str] = Header(None)):
 def query(payload: QueryIn, x_api_key: Optional[str] = Header(None)):
     _check_api_key(x_api_key)
 
-    if not _store:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT c.chunk_text, d.id AS document_id, d.title AS document_title
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id;
+                """
+            )
+            rows = cur.fetchall()
+
+    if not rows:
         return QueryOut(query=payload.query, results=[])
 
-    # Armamos el corpus de chunks con referencia a su documento
-    all_chunks = []
-    chunk_refs = []  # (doc_id, title)
-    for doc_id, d in _store.items():
-        for chunk in d["chunks"]:
-            all_chunks.append(chunk)
-            chunk_refs.append((doc_id, d["title"]))
+    all_chunks = [r["chunk_text"] for r in rows]
 
-    if not all_chunks:
-        return QueryOut(query=payload.query, results=[])
-
-    # TF-IDF sobre corpus + query
     vectorizer = TfidfVectorizer(stop_words=None)
     try:
         tfidf_matrix = vectorizer.fit_transform(all_chunks + [payload.query])
     except ValueError:
-        # corpus vacio tras limpieza
         return QueryOut(query=payload.query, results=[])
 
     query_vec = tfidf_matrix[-1]
@@ -217,9 +271,9 @@ def query(payload: QueryIn, x_api_key: Optional[str] = Header(None)):
 
     results = [
         QueryResultItem(
-            document_id=chunk_refs[i][0],
-            document_title=chunk_refs[i][1],
-            chunk_text=all_chunks[i],
+            document_id=str(rows[i]["document_id"]),
+            document_title=rows[i]["document_title"],
+            chunk_text=rows[i]["chunk_text"],
             score=round(float(sims[i]), 4),
         )
         for i in ranked_idx
