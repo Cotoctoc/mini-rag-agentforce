@@ -33,6 +33,63 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from nltk.stem.snowball import SnowballStemmer
+
+# --------------------------------------------------------------------------
+# Analizador de texto en espanol (stopwords + sinonimos + stemming)
+# --------------------------------------------------------------------------
+# TF-IDF puro falla cuando la pregunta usa una forma de palabra distinta a
+# la del documento (ej. "devolver" en la pregunta vs "devoluciones" en el
+# texto). Un stemmer generico tampoco unifica estos casos porque son
+# derivaciones de distinta categoria gramatical (verbo vs sustantivo), asi
+# que ademas del stemming aplicamos un diccionario de sinonimos acotado a
+# los terminos mas comunes del dominio retail.
+_stemmer = SnowballStemmer("spanish")
+
+_SPANISH_STOPWORDS = {
+    "a", "al", "algo", "algunas", "algunos", "ante", "antes", "como", "con",
+    "contra", "cual", "cuando", "de", "del", "desde", "donde", "durante",
+    "e", "el", "ella", "ellas", "ellos", "en", "entre", "era", "erais",
+    "eramos", "eran", "eres", "es", "esa", "esas", "ese", "eso", "esos",
+    "esta", "estaba", "estado", "estan", "estar", "este", "esto", "estos",
+    "fue", "fueron", "ha", "hay", "la", "las", "le", "les", "lo", "los",
+    "mas", "me", "mi", "mis", "mucho", "muchos", "muy", "nada", "ni", "no",
+    "nos", "nosotros", "o", "os", "otra", "otras", "otro", "otros", "para",
+    "pero", "poco", "por", "porque", "que", "quien", "quienes", "se", "sea",
+    "sin", "sobre", "su", "sus", "tambien", "tanto", "te", "ti", "tiene",
+    "tienen", "todo", "todos", "tu", "tus", "un", "una", "uno", "unos", "y",
+    "ya", "yo",
+}
+
+_SYNONYM_MAP = {
+    "devolver": "devolucion", "devuelvo": "devolucion", "devuelve": "devolucion",
+    "devuelto": "devolucion", "devolucion": "devolucion", "devoluciones": "devolucion",
+    "reembolso": "devolucion", "reembolsar": "devolucion", "reembolsos": "devolucion",
+    "cambiar": "cambio", "cambio": "cambio", "cambios": "cambio", "cambie": "cambio",
+    "enviar": "envio", "envio": "envio", "envios": "envio", "entrega": "envio",
+    "entregas": "envio", "entregar": "envio", "despacho": "envio", "despachar": "envio",
+    "reclamo": "reclamo", "reclamos": "reclamo", "queja": "reclamo", "quejas": "reclamo",
+    "reclamar": "reclamo",
+    "talla": "talla", "tallas": "talla", "medida": "talla", "medidas": "talla",
+    "tamano": "talla", "tamanos": "talla",
+    "garantia": "garantia", "garantias": "garantia",
+    "retiro": "retiro", "retirar": "retiro", "retiras": "retiro",
+    "horario": "horario", "horarios": "horario", "abren": "horario", "cierran": "horario",
+    "atienden": "horario",
+    "pagar": "pago", "pago": "pago", "pagos": "pago",
+}
+
+_TOKEN_RE = re.compile(r"[a-zA-ZñÑáéíóúÁÉÍÓÚ]+")
+
+
+def spanish_analyzer(text: str) -> List[str]:
+    tokens = _TOKEN_RE.findall(text.lower())
+    result = []
+    for tok in tokens:
+        if tok in _SPANISH_STOPWORDS or len(tok) <= 2:
+            continue
+        result.append(_SYNONYM_MAP.get(tok, _stemmer.stem(tok)))
+    return result
 
 # --------------------------------------------------------------------------
 # Configuracion
@@ -255,11 +312,16 @@ def query(payload: QueryIn, x_api_key: Optional[str] = Header(None)):
     if not rows:
         return QueryOut(query=payload.query, results=[])
 
-    all_chunks = [r["chunk_text"] for r in rows]
+    # El titulo suele llevar la senal tematica mas fuerte (ej. "Politica de
+    # Devoluciones"), asi que lo repetimos para darle mas peso en el vector
+    # TF-IDF sin alterar el chunk_text que se devuelve al agente.
+    searchable_texts = [
+        f"{r['document_title']} {r['document_title']} {r['chunk_text']}" for r in rows
+    ]
 
-    vectorizer = TfidfVectorizer(stop_words=None)
+    vectorizer = TfidfVectorizer(analyzer=spanish_analyzer)
     try:
-        tfidf_matrix = vectorizer.fit_transform(all_chunks + [payload.query])
+        tfidf_matrix = vectorizer.fit_transform(searchable_texts + [payload.query])
     except ValueError:
         return QueryOut(query=payload.query, results=[])
 
@@ -279,5 +341,4 @@ def query(payload: QueryIn, x_api_key: Optional[str] = Header(None)):
         for i in ranked_idx
         if sims[i] > 0
     ]
-
     return QueryOut(query=payload.query, results=results)
